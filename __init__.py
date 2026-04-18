@@ -20,6 +20,8 @@ import json
 CLIPBOARD_MODE = None   # "ENTER" | "CREATE" | None
 CURRENT_EDITOR = None
 CARD_QUEUE = []         # cards yet to be shown (dicts)
+LAST_CLIPBOARD_TEXT = "" # avoid resetting queue on focus/inactive same-text
+POLL_TIMER = None        # polling for background clipboard support
 
 # ─────────────────────────────────────────────
 #  PARSING
@@ -287,8 +289,16 @@ def discard_current_card():
     if CLIPBOARD_MODE != "ENTER" or not CURRENT_EDITOR:
         tooltip("Auto-Fill mode is not active.")
         return
+
     if not CARD_QUEUE:
-        tooltip("Queue is empty — nothing to skip to.")
+        # 🗑️ Issue 1: nothing left to skip, so clear the fields instead
+        try:
+            for idx in range(len(CURRENT_EDITOR.note.fields)):
+                CURRENT_EDITOR.note.fields[idx] = ""
+            CURRENT_EDITOR.loadNoteKeepingFocus()
+            tooltip("Queue empty — fields cleared.")
+        except Exception:
+            tooltip("Error clearing fields.")
         return
 
     next_card = CARD_QUEUE.pop(0)
@@ -305,11 +315,24 @@ def discard_current_card():
 # ─────────────────────────────────────────────
 
 def on_clipboard_change():
-    global CLIPBOARD_MODE, CURRENT_EDITOR
+    global CLIPBOARD_MODE, CURRENT_EDITOR, LAST_CLIPBOARD_TEXT
     if not CLIPBOARD_MODE or not CURRENT_EDITOR:
         return
+
+    # Basic safety check for editor
     try:
-        text = QApplication.clipboard().text()
+        if not CURRENT_EDITOR.widget:
+            return
+    except (AttributeError, RuntimeError):
+        # Editor likely closed/deleted
+        return
+
+    try:
+        text = QApplication.clipboard().text().strip()
+        if not text or text == LAST_CLIPBOARD_TEXT:
+            return
+
+        LAST_CLIPBOARD_TEXT = text
         process_text(CURRENT_EDITOR, text, auto_add=(CLIPBOARD_MODE == "CREATE"))
     except Exception:
         pass
@@ -320,16 +343,29 @@ def on_clipboard_change():
 # ─────────────────────────────────────────────
 
 def toggle_mode(editor: Editor, mode: str):
-    global CLIPBOARD_MODE, CURRENT_EDITOR, CARD_QUEUE
+    global CLIPBOARD_MODE, CURRENT_EDITOR, CARD_QUEUE, LAST_CLIPBOARD_TEXT, POLL_TIMER
     if CLIPBOARD_MODE == mode:
+        # Off
         CLIPBOARD_MODE = None
         CARD_QUEUE = []
+        LAST_CLIPBOARD_TEXT = ""
+        if POLL_TIMER:
+            POLL_TIMER.stop()
+            POLL_TIMER = None
         tooltip("Monitor off.")
     else:
+        # On
         CLIPBOARD_MODE = mode
         CURRENT_EDITOR = editor
+        LAST_CLIPBOARD_TEXT = QApplication.clipboard().text().strip()
         name = "Auto-Fill" if mode == "ENTER" else "Auto-Create"
         tooltip(f"{name} mode ON — waiting for clipboard…")
+
+        # Start polling for background support (helps on Wayland/background apps)
+        if not POLL_TIMER:
+            POLL_TIMER = QTimer()
+            POLL_TIMER.timeout.connect(on_clipboard_change)
+            POLL_TIMER.start(800) # every 800ms
 
     highlight_button(editor, "enter",  CLIPBOARD_MODE == "ENTER")
     highlight_button(editor, "create", CLIPBOARD_MODE == "CREATE")
